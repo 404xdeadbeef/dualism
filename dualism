@@ -1,0 +1,519 @@
+#!/bin/bash
+
+# === Version ===
+readonly VERSION="1.0"
+
+# === Paths ===
+CONFIG_DIR="/etc/dualism"
+CONFIG_FILE="$CONFIG_DIR/config"
+MESSAGES_DIR="$CONFIG_DIR"
+LOG_ROOT="/var/log/dualism"
+STATE_FILE="/tmp/dualism_state"
+HEARTBEAT_FILE="/tmp/dualism_heartbeat"
+TARGET_BIN="/usr/local/bin/dualism"
+
+# === Check if installed ===
+if [[ "$0" != "$TARGET_BIN" ]]; then
+    echo "dualism is not installed."
+    echo "Use: sudo ./install.sh"
+    echo "Repository: https://github.com/404xdeadbeef/dualism"
+    exit 1
+fi
+
+# === Load config ===
+if [ -f "$CONFIG_FILE" ]; then
+    source "$CONFIG_FILE"
+else
+    echo "dualism: configuration file not found: $CONFIG_FILE"
+    echo "Please edit /etc/dualism/config and run: sudo dualism -s"
+    exit 1
+fi
+
+# === Handle email list ===
+if [ -n "$ADMIN_EMAILS_STR" ]; then
+    read -r -a ADMIN_EMAILS <<< "$ADMIN_EMAILS_STR"
+else
+    echo "dualism: ADMIN_EMAILS_STR is not set in config"
+    exit 1
+fi
+
+# === Messages (loaded by language) ===
+declare -A MSG
+if [ -f "$MESSAGES_DIR/messages-${LANGUAGE}.conf" ]; then
+    source "$MESSAGES_DIR/messages-${LANGUAGE}.conf"
+else
+    echo "dualism: message file not found: $MESSAGES_DIR/messages-${LANGUAGE}.conf"
+    exit 1
+fi
+
+# === Show help ===
+show_help() {
+    cat << EOF
+
+    dualism v${VERSION} - ${MSG[help_name]}
+
+${MSG[help_synopsis]}
+    dualism [OPTION]
+
+${MSG[help_description]}
+    ${MSG[help_desc]}
+
+${MSG[help_options]}
+    -s, --start       ${MSG[start]}
+    -n, --dry-run     ${MSG[dry]}
+    -h, --help        ${MSG[help]}
+    --version         ${MSG[version]}
+    --uninstall       ${MSG[uninstall]}
+	
+${MSG[help_examples]}
+    sudo dualism -s
+    sudo dualism -n
+    dualism --help
+    sudo dualism --uninstall
+	
+${MSG[help_config]}
+	${MSG[help_config_file]}
+
+${MSG[help_log]}
+	${MSG[help_log_file]}
+
+${MSG[help_automation]}
+    ${MSG[help_cron]}
+
+${MSG[help_support]}
+
+EOF
+}
+
+# === Show version ===
+show_version() {
+    echo "dualism v${VERSION}"
+}
+
+# === Check root ===
+require_root() {
+    if [ "$(id -u)" -ne 0 ]; then
+        echo "dualism: ${MSG[require_root]}"
+        echo "Use: sudo dualism [OPTION]"
+        exit 1
+    fi
+}
+
+# === Parse arguments ===
+parse_args() {
+    local has_arg=0
+    for arg in "$@"; do
+        case "$arg" in
+            -s|--start)
+                has_arg=1
+                run_check=1
+                ;;
+            -n|--dry-run)
+                has_arg=1
+                in_dry_run=1
+                run_check=1
+                ;;
+            -h|--help)
+                has_arg=1
+                show_help
+                exit 0
+                ;;
+            --version)
+                has_arg=1
+                show_version
+                exit 0
+                ;;
+            --uninstall)
+                has_arg=1
+                run_uninstall=1
+                ;;
+            *)
+                echo "dualism: ${MSG[unknown_arg]}: $arg"
+                echo "${MSG[use_help]}"
+                exit 1
+                ;;
+        esac
+    done
+
+    # If there were no arguments, there is an error
+    if [ $has_arg -eq 0 ]; then
+        echo "dualism: ${MSG[missing_arg]}"
+        echo "${MSG[use_help]}"
+        exit 1
+    fi
+}
+
+# === Uninstall ===
+uninstall() {
+    echo "${MSG[uninstall_running]}"
+    echo
+
+    # Remove from cron
+    echo "${MSG[removing_cron]}"
+    crontab -l 2>/dev/null | grep -v "dualism" | crontab - 2>/dev/null || {
+        echo "${MSG[warn_crontab_fail]}"
+    }
+
+    # Remove logs
+    if [ -d "$LOG_ROOT" ]; then
+        echo "${MSG[removing_logs]}: $LOG_ROOT"
+        rm -rf "$LOG_ROOT"
+    fi
+
+    # Remove config
+    if [ -d "$CONFIG_DIR" ]; then
+        echo "${MSG[removing_config]}: $CONFIG_DIR"
+        rm -rf "$CONFIG_DIR"
+    fi
+
+    # Remove temporary files
+    echo "${MSG[cleanup_temp]}"
+    rm -f "$STATE_FILE"
+    rm -f "$HEARTBEAT_FILE"
+    rm -f "$LOCK_FILE"
+
+    # Final message
+    echo
+    echo "${MSG[uninstall_completed]}"
+    echo "${MSG[uninstall_data_removed]}"
+    echo
+    echo "${MSG[verify_cleanup]}:"
+    echo "  - $TARGET_BIN"
+    echo "  - $CONFIG_DIR"
+    echo "  - $LOG_ROOT"
+    echo "  - crontab (run: crontab -l)"
+    echo
+    echo "${MSG[manual_remove_bin]}:"
+    echo "  sudo rm -f $TARGET_BIN"
+    echo
+    echo "${MSG[help_support]}"
+    exit 0
+}
+
+# === Setup log path ===
+setup_log_path() {
+    local now=$(date '+%Y %m %d')
+    read -r year month day <<< "$now"
+    LOG_DIR="$LOG_ROOT/$year/$month"
+    LOG_FILE="$LOG_DIR/$day.log"
+    mkdir -p "$LOG_DIR" || {
+        echo "dualism: ${MSG[log_fail_dir]}: $LOG_DIR" >&2
+        exit 1
+    }
+    touch "$LOG_FILE" 2>/dev/null || {
+        echo "dualism: ${MSG[log_fail_file]}: $LOG_FILE" >&2
+        exit 1
+    }
+    chown -R root:root "$LOG_ROOT" 2>/dev/null || true
+    chmod -R 755 "$LOG_ROOT" 2>/dev/null || true
+    ln -sf "$LOG_FILE" "/var/log/dualism/current.log" 2>/dev/null || true
+}
+
+# === Logging ===
+log_event() {
+    local level="$1"
+    local message="$2"
+    local timestamp=$(date '+%H:%M:%S')
+    local log_line="[$timestamp] [$level] $message"
+    echo "$log_line" >> "$LOG_FILE"
+    if [ $in_dry_run -eq 1 ] && [ -t 1 ]; then
+        echo "$log_line"
+    fi
+}
+
+# === Send notification ===
+# Send email alerts with proper UTF-8 encoding and headers
+# Ensures "To:" is visible in email clients by including it in both --to and body
+# Uses temporary file to preserve formatting and character encoding
+send_notification() {
+    local type="$1"          # ALERT, OK
+    local trigger="$2"       # MANUAL CHECK, AUTOMATIC START, HEARTBEAT
+    local issue="$3"         # Short description of the event
+    local details="$4"       # Detailed findings (e.g., PING access, MAC detected)
+
+    # Construct message tag and subject
+    local tag="[$type]"
+    local subject="$tag: $trigger — $issue"
+
+    # Format the email body using localized messages
+    # Ensures all text (especially non-ASCII) is correctly structured
+    local body_header=$(printf "%s\n%s\n%s\n\n%s:\n  - %s → %s\n  - %s → %s\n\n%s:\n%s" \
+        "${MSG[mail_host]} $(hostname)" \
+        "${MSG[mail_time]} $(date)" \
+        "${MSG[mail_status]} $type" \
+        "${MSG[mail_interfaces]}" \
+        "$INTERFACE_A" "${MSG[mail_net_a]}" \
+        "$INTERFACE_B" "${MSG[mail_net_b]}" \
+        "${MSG[mail_details]}" \
+        "$details")
+
+    # Create a temporary file for each recipient to ensure UTF-8 integrity
+    local tmpfile=$(mktemp)
+
+    # Loop through each admin email
+    for recipient in "${ADMIN_EMAILS[@]}"; do
+        # Write full email headers and body into the temp file
+        # Important: "To:" header must match --to in swaks to avoid issues
+        {
+            echo "To: $recipient"
+            echo "From: $SMTP_SENDER"
+            echo "Subject: $subject"
+            echo "Content-Type: text/plain; charset=utf-8"
+            echo "Content-Transfer-Encoding: 8bit"
+            echo ""  # Empty line separates headers from body
+            echo "$body_header"
+        } > "$tmpfile"
+
+        # Construct swaks command
+        # --to is required for swaks to know the destination
+        # --data sends the full raw message with headers
+        # --ehlo ensures proper SMTP handshake
+        # --timeout prevents hanging
+        local cmd="swaks --to '$recipient' --server '$SMTP_SERVER:$SMTP_PORT' --data '$tmpfile' --ehlo '$(hostname)' --timeout 10"
+
+        # Execute command silently
+        if TERM=dumb script -q -c "$cmd" > /tmp/dualism-swaks.log 2>&1; then
+            # Success: log with localized message
+            log_event "$type" "${MSG[notification_sent]}: $subject → $recipient"
+        else
+            # Failure: log error and show swaks output for INFOging
+            log_event "ERROR" "${MSG[send_failed]}: $recipient"
+            if [ -f /tmp/dualism-swaks.log ]; then
+                cat /tmp/dualism-swaks.log >&2
+            fi
+        fi
+    done
+
+    # Clean up temporary file
+    rm -f "$tmpfile"
+}
+
+# === Heartbeat ===
+send_heartbeat_if_needed() {
+    local now=$(date +%s)
+    if [ -f "$HEARTBEAT_FILE" ]; then
+        local last_time=$(stat -c %Y "$HEARTBEAT_FILE" 2>/dev/null)
+        if [ -n "$last_time" ] && [ $((now - last_time)) -lt $HEARTBEAT_INTERVAL ]; then
+            log_event "INFO" "${MSG[heartbeat_recent]}"
+            return
+        fi
+    fi
+    send_notification "OK" "HEARTBEAT" "${MSG[heartbeat_subject]}" \
+        "${MSG[heartbeat_body]}"
+    touch "$HEARTBEAT_FILE"
+    log_event "INFO" "Heartbeat sent"
+}
+
+# === Add to cron on first run ===
+add_to_cron_if_needed() {
+    # Make sure CHECK_INTERVAL is set
+    if [ -z "$CHECK_INTERVAL" ]; then
+        log_event "ERROR" "CHECK_INTERVAL is not set in config"
+        return 1
+    fi
+
+    local job="*/$CHECK_INTERVAL * * * * $TARGET_BIN -s > /dev/null 2>&1"
+    if ! crontab -l 2>/dev/null | grep -Fq "dualism -s"; then
+        (crontab -l 2>/dev/null; echo "$job") | crontab -
+        log_event "INFO" "Added to cron: $job"
+    fi
+}
+
+# === Add temp IPs ===
+add_temp_ips() {
+    ip addr add "$TEMP_IP_A" dev "$INTERFACE_A" 2>/dev/null && \
+        log_event "INFO" "${MSG[ip_added]}: $TEMP_IP_A on $INTERFACE_A"
+    ip addr add "$TEMP_IP_B" dev "$INTERFACE_B" 2>/dev/null && \
+        log_event "INFO" "${MSG[ip_added]}: $TEMP_IP_B on $INTERFACE_B"
+}
+
+# === Remove temp IPs ===
+remove_temp_ips() {
+    ip addr del "$TEMP_IP_A" dev "$INTERFACE_A" 2>/dev/null && \
+        log_event "INFO" "${MSG[ip_removed]}: $TEMP_IP_A"
+    ip addr del "$TEMP_IP_B" dev "$INTERFACE_B" 2>/dev/null && \
+        log_event "INFO" "${MSG[ip_removed]}: $TEMP_IP_B"
+}
+
+# === Flush ARP ===
+flush_arp() {
+    ip neigh flush dev "$INTERFACE_A" 2>/dev/null || true
+    ip neigh flush dev "$INTERFACE_B" 2>/dev/null || true
+    log_event "INFO" "${MSG[arp_flushed]}"
+}
+
+# === Collect ARP ===
+collect_arp() {
+    log_event "INFO" "${MSG[arp_start]}"
+    arping -c 3 -f -q -I "$INTERFACE_A" "$IP_B" > /dev/null 2>&1 && \
+        log_event "INFO" "${MSG[arp_recv]} $IP_B via $INTERFACE_A"
+    arping -c 3 -f -q -I "$INTERFACE_B" "$IP_A" > /dev/null 2>&1 && \
+        log_event "INFO" "${MSG[arp_recv]} $IP_A via $INTERFACE_B"
+    sleep 1.5
+    log_event "INFO" "${MSG[arp_done]}"
+}
+
+# === Detect dual host ===
+detect_dual_host() {
+    local found=""
+    local macs_a=$(ip neigh show dev "$INTERFACE_A" | awk '{print $5}' | tr '[:upper:]' '[:lower:]')
+    local macs_b=$(ip neigh show dev "$INTERFACE_B" | awk '{print $5}' | tr '[:upper:]' '[:lower:]')
+    for mac in $macs_a; do
+        if echo "$macs_b" | grep -qw "$mac"; then
+            log_event "WARN" "${MSG[dual_host]}: $mac"
+            found="$found MAC:$mac "
+        fi
+    done
+    echo "$found"
+}
+
+# === Main logic ===
+main() {
+    local start_time=$(date +%s)
+
+    # === Lock ===
+    exec 200>/tmp/dualism-check.lock
+    if ! flock -n 200; then
+        log_event "WARN" "${MSG[already_running]}"
+        exit 0
+    fi
+
+    setup_log_path
+    add_to_cron_if_needed
+    add_temp_ips
+    sleep 2
+    flush_arp
+    collect_arp
+    remove_temp_ips
+
+    # === Analysis ===
+    local current_status="OK"
+    local alert_type=""
+    local details=""
+
+    if ping -c1 -W2 -I "$INTERFACE_A" "$IP_B" > /dev/null 2>&1; then
+        alert_type="ping"
+        details="• ${MSG[ping_access]} $IP_B ${MSG[via]} $INTERFACE_A"
+        current_status="ALERT"
+        log_event "WARN" "PING: $INTERFACE_A → $IP_B"
+    fi
+
+    if ping -c1 -W2 -I "$INTERFACE_B" "$IP_A" > /dev/null 2>&1; then
+        alert_type="${alert_type:+$alert_type+}ping"
+        details="${details:+$details\n}• ${MSG[ping_access]} $IP_A ${MSG[via]} $INTERFACE_B"
+        current_status="ALERT"
+        log_event "WARN" "PING: $INTERFACE_B → $IP_A"
+    fi
+
+    if ip neigh show dev "$INTERFACE_A" | grep -qi "$MAC_B"; then
+        alert_type="${alert_type:+$alert_type+}mac"
+        details="${details:+$details\n}• ${MSG[mac_detected]} $MAC_B ${MSG[on_arp]} $INTERFACE_A"
+        current_status="ALERT"
+        log_event "WARN" "MAC: $MAC_B ${MSG[found_on]} $INTERFACE_A"
+    fi
+
+    if ip neigh show dev "$INTERFACE_B" | grep -qi "$MAC_A"; then
+        alert_type="${alert_type:+$alert_type+}mac"
+        details="${details:+$details\n}• ${MSG[mac_detected]} $MAC_A ${MSG[on_arp]} $INTERFACE_B"
+        current_status="ALERT"
+        log_event "WARN" "MAC: $MAC_A ${MSG[found_on]} $INTERFACE_B"
+    fi
+
+    local dual_hosts=$(detect_dual_host)
+    if [ -n "$dual_hosts" ]; then
+        alert_type="${alert_type:+$alert_type+}dual"
+        details="${details:+$details\n}• ${MSG[dual_host_detected]}: $dual_hosts"
+        current_status="ALERT"
+    fi
+
+    # === State handling ===
+    local was_alert=0
+    if [ -f "$STATE_FILE" ]; then
+        was_alert=1
+    fi
+
+    local is_manual=0
+    [ -t 1 ] && [ -n "$TERM" ] && is_manual=1
+
+    if [ $is_manual -eq 1 ] && [ $in_dry_run -eq 0 ]; then
+        local trigger="${MSG[manual_check]}"
+        if [ "$current_status" = "OK" ]; then
+            # Pass MSG[no_signs] as details
+            send_notification "OK" "$trigger" "${MSG[no_bridging]}" "${MSG[no_signs]}"
+        else
+            local issue=""
+            case "$alert_type" in
+                *dual*)   issue="${MSG[host_in_both]}" ;;
+                *ping*mac*) issue="${MSG[critical_merge]}" ;;
+                *ping*)   issue="${MSG[access_ping]}" ;;
+                *mac*)    issue="${MSG[foreign_mac]}" ;;
+                *)        issue="${MSG[suspicion]}" ;;
+            esac
+            send_notification "ALERT" "$trigger" "$issue" "$details"
+        fi
+    else
+        if [ "$current_status" = "OK" ] && [ $was_alert -eq 1 ]; then
+            if [ $in_dry_run -eq 0 ]; then
+                send_notification "OK" "${MSG[auto_start]}" "${MSG[isolation_restored]}" \
+                    "${MSG[isolation_restored_body]}"
+            fi
+            rm -f "$STATE_FILE"
+            log_event "INFO" "${MSG[state_removed]}"
+        elif [ "$current_status" = "ALERT" ]; then
+            if [ $in_dry_run -eq 0 ]; then
+                case "$alert_type" in
+                    *dual*) send_notification "ALERT" "${MSG[auto_start]}" "${MSG[host_in_both]}" "$details" ;;
+                    *ping*mac*) send_notification "ALERT" "${MSG[auto_start]}" "${MSG[critical_merge]}" "$details" ;;
+                    *ping*) send_notification "ALERT" "${MSG[auto_start]}" "${MSG[access_ping]}" "$details" ;;
+                    *mac*) send_notification "ALERT" "${MSG[auto_start]}" "${MSG[foreign_mac]}" "$details" ;;
+                    *) send_notification "ALERT" "${MSG[auto_start]}" "${MSG[suspicion]}" "$details" ;;
+                esac
+            fi
+            echo "$(date): $alert_type" > "$STATE_FILE"
+            log_event "INFO" "${MSG[state_updated]}: $alert_type"
+        fi
+        if [ $in_dry_run -eq 0 ]; then
+            send_heartbeat_if_needed
+        fi
+    fi
+
+    local duration=$(( $(date +%s) - start_time ))
+    log_event "INFO" "${MSG[execution_done]} $duration ${MSG[seconds]}"
+
+	if [ $in_dry_run -eq 1 ] && [ $is_manual -eq 1 ]; then
+    local status_text="$current_status"
+    if [ "$current_status" = "OK" ]; then
+         status_text="${MSG[status_ok]}"
+    else
+         status_text="${MSG[status_alert]}"
+    fi
+
+	local details_text="${details:-${MSG[no_signs]}}"
+
+    echo
+    echo
+    echo "      $status_text"
+    echo "      $details_text."
+    echo
+fi
+
+}
+
+# === Initialize ===
+in_dry_run=0
+run_check=0
+run_uninstall=0
+
+# === Entry point ===
+require_root
+
+# === Parse arguments FIRST ===
+parse_args "$@"
+
+if [ $run_uninstall -eq 1 ]; then
+    uninstall
+fi
+
+if [ $run_check -eq 1 ]; then
+    main "$@"
+fi

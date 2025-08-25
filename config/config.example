@@ -1,0 +1,21 @@
+# dualism configuration
+# Edit this file to customize dualism behavior
+
+# TELEGRAM_BOT_TOKEN="your_bot_token_here"
+# TELEGRAM_CHAT_ID="your_chat_id_here"
+
+INTERFACE_A="eth1"
+INTERFACE_B="eth2"
+IP_A="192.168.0.1"
+IP_B="10.0.0.1"
+MAC_B="ab:cd:ef:12:34:56"
+MAC_A="ab:cd:ef:12:34:56"
+TEMP_IP_A="10.0.0.254/24"     # A temporary IP in Network A
+TEMP_IP_B="192.168.0.254/24"  # A temporary IP in Network B
+ADMIN_EMAILS_STR="admin@company.com alert@company.com"
+SMTP_SENDER="alert@company.com"
+SMTP_SERVER="192.168.0.100"
+SMTP_PORT="25"
+CHECK_INTERVAL=2
+HEARTBEAT_INTERVAL=86400
+LANGUAGE="en"
